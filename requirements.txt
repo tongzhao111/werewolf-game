@@ -1,0 +1,3 @@
+agentscope>=2.0.8
+pydantic>=2.13.0
+openai>=1.0.0
