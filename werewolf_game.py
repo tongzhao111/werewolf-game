@@ -57,6 +57,66 @@ class WitchAction(BaseModel):
     )
 
 
+# ==================== 人类玩家代理 ====================
+class MockTextBlock:
+    """模拟 AgentScope 的 TextBlock"""
+    def __init__(self, text):
+        self.text = text
+
+
+class MockReply:
+    """模拟 AgentScope 的 reply 返回值"""
+    def __init__(self, text=None, structured_output=None):
+        if text is not None:
+            self.content = [MockTextBlock(text)]
+        else:
+            self.content = []
+        self.structured_output = structured_output
+
+
+class HumanAgent:
+    """人类玩家：接口和 Agent 一致，内部用 input() 读取用户输入"""
+    _is_human = True
+
+    def __init__(self, name, role):
+        self.name = name
+        self.role = role
+        self._system_prompt = f"你是{name}，身份是{role}"
+
+    async def reply(self, user_msg, structured_schema=None):
+        # 提取提示词文本
+        content = user_msg.content
+        if isinstance(content, list) and len(content) > 0:
+            first = content[0]
+            prompt_text = first.text if hasattr(first, "text") else str(first)
+        else:
+            prompt_text = str(content)
+
+        # 显示给玩家
+        print("\n" + "=" * 60)
+        print(f"💬 轮到你了（{self.name}）")
+        print("=" * 60)
+        print(prompt_text)
+        print("-" * 60)
+
+        if structured_schema is not None:
+            # 结构化输出（投票）
+            while True:
+                user_input = input("👉 请输入你要投票淘汰的玩家名字: ").strip()
+                if user_input:
+                    break
+                print("⚠️ 输入不能为空，请重新输入")
+            return MockReply(
+                structured_output={"target": user_input, "reason": "（玩家投票）"}
+            )
+        else:
+            # 普通发言
+            user_input = input("👉 请输入你的发言（回车确认）: ").strip()
+            if not user_input:
+                user_input = "（沉默）"
+            return MockReply(text=user_input)
+
+
 # ==================== 日志 ====================
 class GameLogger:
     def __init__(self, game_index):
@@ -65,14 +125,22 @@ class GameLogger:
         self._print = print
 
     def log(self, text=""):
-        self.lines.append(str(text))
-        self._print(text)
+        # ★ 清理代理字符，避免打印和保存时崩溃
+        text = _clean_text(str(text))
+        self.lines.append(text)
+        # 打印时也用清理过的文本
+        try:
+            self._print(text)
+        except UnicodeEncodeError:
+            self._print(text.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore"))
 
     def save(self, directory="game_logs"):
         os.makedirs(directory, exist_ok=True)
         path = os.path.join(directory, f"game_{self.game_index:03d}.txt")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(self.lines))
+        # ★ 保存前再次清理，双重保险
+        cleaned_lines = [_clean_text(line) for line in self.lines]
+        with open(path, "w", encoding="utf-8", errors="ignore") as f:
+            f.write("\n".join(cleaned_lines))
         return path
 
 
@@ -82,6 +150,24 @@ async def safe_reply(agent, user_msg, structured_schema=None, logger=None):
         if structured_schema is not None:
             return await agent.reply(user_msg, structured_schema=structured_schema)
         return await agent.reply(user_msg)
+    except UnicodeEncodeError as e:
+        # ★ 代理字符导致的编码错误：清理后重试一次
+        err_msg = f"   ⚠️ {agent.name} 遇到编码问题，正在清理后重试..."
+        if logger:
+            logger.log(err_msg)
+        else:
+            print(err_msg)
+        try:
+            if structured_schema is not None:
+                return await agent.reply(user_msg, structured_schema=structured_schema)
+            return await agent.reply(user_msg)
+        except Exception as e2:
+            err_msg2 = f"   ⚠️ {agent.name} 重试仍失败：{type(e2).__name__}: {e2}"
+            if logger:
+                logger.log(err_msg2)
+            else:
+                print(err_msg2)
+            return None
     except Exception as e:
         err_msg = f"   ⚠️ {agent.name} 调用失败：{type(e).__name__}: {e}"
         if logger:
@@ -90,12 +176,21 @@ async def safe_reply(agent, user_msg, structured_schema=None, logger=None):
             print(err_msg)
         return None
 
+def _clean_text(s):
+    """清理字符串中的代理字符（surrogates），避免 UTF-8 编码错误"""
+    if s is None:
+        return None
+    if not isinstance(s, str):
+        s = str(s)
+    # 先尝试用 utf-8 编码，无法编码的字符直接丢弃
+    return s.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
 
 def _extract_text(reply):
     if reply is None or not reply.content:
         return None
     first = reply.content[0]
-    return first.text if hasattr(first, "text") else str(first)
+    text = first.text if hasattr(first, "text") else str(first)
+    return _clean_text(text)
 
 
 def _extract_structured(reply):
@@ -130,7 +225,6 @@ def build_role_prompt(name, role, all_names):
             "- 如果有人跳预言家指认你，你可以反驳他是'悍跳'，或者反咬他是狼。\n"
             "- 优先和另一个狼人配合，一唱一和分散好人注意力。\n"
         )
-
     elif role == "预言家":
         base += (
             "你是预言家，属于好人阵营。\n"
@@ -139,91 +233,37 @@ def build_role_prompt(name, role, all_names):
             "1. 如果你第一晚查验到【狼人】，第二天必须立即跳预言家大声宣布："
             "'我是预言家，昨夜我查验了XXX，他是狼人！请大家跟我一起投他。'\n"
             "2. 如果你第一晚查验到【好人】，第二天可以视情况决定是否跳。\n"
-            "3. 【绝对禁止】不要说出'昨夜狼人刀的是XXX'——你不可能知道狼人刀谁。\n"
+            "3. 【绝对禁止】不要说出'昨夜狼人刀的是XXX'。\n"
             "4. 被反驳时要坚定立场：'我确实是预言家，请好人信任我。'\n"
-            "5. 如果你被投票出局，遗言必须再次强调查验结果。\n"
         )
-
-
     elif role == "女巫":
-
         base += (
-
             "你是女巫，属于好人阵营。\n"
-
-            "你有一瓶解药（救活一名被狼人杀害的玩家）和一瓶毒药（毒死一名玩家），各限一次。\n"
-
+            "你有一瓶解药和一瓶毒药，各限一次。\n"
             "★ 关键策略：\n"
-
             "1. 第一晚通常建议使用解药，救活被杀的玩家。\n"
-
             "2. 使用解药后不要急着公开身份，先观察预言家有没有跳出来。\n"
-
-            "3. 【绝对禁止】不要说出'昨夜狼人刀的是XXX'，否则会被当成狼人。\n"
-
-            "4. 【毒药使用规则——非常重要】毒药是最后的武器，不是常规手段。\n"
-
-            "   - 第 1 晚绝对不要使用毒药（没有任何信息，必然毒错）。\n"
-
-            "   - 只有满足以下任一条件，才考虑使用毒药：\n"
-
-            "     (a) 已有一个真预言家跳出来，明确指认某人是狼人。\n"
-
-            "     (b) 你自己通过观察，非常确定某人是狼人（有具体证据）。\n"
-
-            "   - 如果你没有 90% 以上的把握，宁可不用毒药，把毒药留到后面更关键的回合。\n"
-
-            "   - 毒错一个好人 = 帮助狼人少杀一次，代价极高。\n"
-
-            "5. 记住：不用毒药不是失败，用错毒药才是失误。\n"
-
+            "3. 【绝对禁止】不要说出'昨夜狼人刀的是XXX'。\n"
+            "4. 毒药宝贵，只在有 90% 以上把握时使用。宁可不用，也不要毒错好人。\n"
         )
-
-
     elif role == "守卫":
-
         base += (
-
             "你是守卫，属于好人阵营。\n"
-
             "每晚你可以守护一名玩家，被守护的人当晚不会被狼人杀死。\n"
-
             "★ 关键策略（按优先级）：\n"
-
             "1. 【最高优先级】如果场上有人跳预言家，立刻守护他。\n"
-
-            "   预言家是狼人的头号目标，多活一晚就多一次查验，价值极高。\n"
-
             "2. 【次高优先级】如果没人跳预言家，优先守护自己。\n"
-
-            "   你活着才能持续守护别人；你死了，好人就少一层保险。\n"
-
             "3. 【第三优先级】守护那些'发言积极、明显是好人'的玩家。\n"
-
-            "   例如：仔细分析局势、给出具体推理、被多人认可的人。\n"
-
             "4. 【规则提醒】不要连续两晚守护同一个人。\n"
-
-            "   如果今晚想守护的人，昨晚已经守护过，就改守自己或别人。\n"
-
-            "5. 如果你被投票出局，遗言可以说明你守护过谁，帮助好人推理。\n"
-
-            "★ 核心原则：守卫的价值在于'挡掉狼刀'，不是随便猜。\n"
-
-            "  当你不知道守谁时，守自己（至少保证自己活着）。\n"
-
         )
-
     else:  # 村民
         base += (
             "你是普通村民，属于好人阵营。\n"
             "★ 关键策略：\n"
             "1. 【不要盲从】不要因为某个人说得大声就跟着投票。要有自己的推理。\n"
             "2. 【识别真假预言家】看谁的跳预言家时机更自然、谁在积极给其他玩家'定身份'。\n"
-            "3. 【观察狼人特征】以下行为高度可疑：急着带节奏投票、不提具体证据、"
-            "谁在预言家跳出来后立刻反驳。\n"
+            "3. 【观察狼人特征】急着带节奏投票、不提具体证据、预言家跳出来后立刻反驳的人，可疑。\n"
             "4. 【发言要有依据】引用前面玩家的具体发言进行赞同或反驳。\n"
-            "5. 如果不知道该投谁，投那个'发言最急切、最想带节奏'的人。\n"
         )
 
     base += (
@@ -248,26 +288,27 @@ class WerewolfGame:
         self.guard = None
         self.antidote_available = True
         self.poison_available = True
-        self.last_guarded = None  # ★ 守卫上一晚守护过谁
+        self.last_guarded = None
         self.round_num = 0
         self.last_words_history = []
-        # 统计
         self.poison_hit_wolf = 0
         self.poison_hit_good = 0
         self.antidote_used = False
         self.poison_used = False
-        self.guard_saved_night = 0  # ★ 守卫成功救人的次数
+        self.guard_saved_night = 0
 
     def setup_roles(self, num_werewolves=2):
-        """8 人局：2 狼 + 1 预言家 + 1 女巫 + 1 守卫 + 3 村民"""
-        names = self.player_names.copy()
-        random.shuffle(names)
+        """分配角色：人类玩家固定为村民，其他角色随机分给 AI"""
+        HUMAN_NAME = "你"
 
-        wolves = names[:num_werewolves]
-        seer = names[num_werewolves]
-        witch = names[num_werewolves + 1]
-        guard = names[num_werewolves + 2]
-        villagers = names[num_werewolves + 3:]
+        ai_names = [n for n in self.player_names if n != HUMAN_NAME]
+        random.shuffle(ai_names)
+
+        wolves = ai_names[:num_werewolves]
+        seer = ai_names[num_werewolves]
+        witch = ai_names[num_werewolves + 1]
+        guard = ai_names[num_werewolves + 2]
+        villagers = ai_names[num_werewolves + 3:]
 
         self.werewolves = set(wolves)
         self.seer = seer
@@ -281,14 +322,19 @@ class WerewolfGame:
         self.roles[guard] = "守卫"
         for v in villagers:
             self.roles[v] = "村民"
+        self.roles[HUMAN_NAME] = "村民"
 
         for name in self.player_names:
-            self.players[name] = create_agent(
-                name,
-                build_role_prompt(name, self.roles[name], self.player_names),
-            )
+            if name == HUMAN_NAME:
+                self.players[name] = HumanAgent(name, "村民")
+            else:
+                self.players[name] = create_agent(
+                    name,
+                    build_role_prompt(name, self.roles[name], self.player_names),
+                )
 
-        self.logger.log(f"\n🎮 角色分配完成（只有狼人知道自己是谁）")
+        self.logger.log(f"\n🎮 角色分配完成")
+        self.logger.log(f"   ⭐ 你的身份：村民")
         self.logger.log(
             f"   （调试信息）狼人：{self.werewolves}，预言家：{self.seer}，"
             f"女巫：{self.witch}，守卫：{self.guard}\n"
@@ -390,21 +436,17 @@ class WerewolfGame:
         return target
 
     async def guard_phase(self):
-        """★ 守卫守护"""
         if self.guard not in self.alive:
             return None
 
         guard_agent = self.players[self.guard]
         self.logger.log(f"\n🛡️ 守卫正在守护...")
 
-        # 不能连续两晚守护同一人
         candidates = [n for n in self.alive if n != self.last_guarded]
         if not candidates:
-            candidates = list(self.alive)  # 兜底
+            candidates = list(self.alive)
 
-        prompt = (
-            f"你是守卫。请选择今晚要守护的玩家。候选：{candidates}"
-        )
+        prompt = f"你是守卫。请选择今晚要守护的玩家。候选：{candidates}"
         if self.last_guarded:
             prompt += f"\n（注意：你上一晚守护了 {self.last_guarded}，规则不允许连续两晚守护同一人）"
 
@@ -429,7 +471,6 @@ class WerewolfGame:
         return target
 
     async def witch_phase(self, killed, guarded):
-        """女巫行动：救人 或 毒人"""
         if self.witch not in self.alive:
             return killed, None
 
@@ -627,7 +668,7 @@ class WerewolfGame:
 
     async def run_single_game(self):
         self.logger.log("=" * 60)
-        self.logger.log(f"🎮 三国狼人杀（第 {self.game_index} 局，8 人局含守卫）")
+        self.logger.log(f"🎮 三国狼人杀（人机对战 · 第 {self.game_index} 局）")
         self.logger.log(f"   参与者：{self.player_names}")
         self.logger.log("=" * 60)
 
@@ -639,16 +680,13 @@ class WerewolfGame:
             self.logger.log(f"第 {self.round_num} 轮")
             self.logger.log(f"{'=' * 60}")
 
-            # ★ 夜晚顺序：预言家 → 守卫 → 狼人 → 女巫
             await self.seer_phase()
             guarded = await self.guard_phase()
             killed = await self.werewolf_phase()
             final_killed, poisoned = await self.witch_phase(killed, guarded)
 
-            # ★ 结算死亡：狼刀 + 守卫救人 + 女巫救人 + 女巫毒人
             night_deaths = []
 
-            # 狼刀（如果没被守卫救、也没被女巫救）
             if final_killed and final_killed in self.alive:
                 if final_killed == guarded:
                     self.guard_saved_night += 1
@@ -657,7 +695,6 @@ class WerewolfGame:
                     self.alive.discard(final_killed)
                     night_deaths.append(final_killed)
 
-            # 女巫毒人（无视守卫）
             if poisoned and poisoned in self.alive:
                 self.alive.discard(poisoned)
                 night_deaths.append(poisoned)
@@ -708,74 +745,14 @@ class WerewolfGame:
         }
 
 
-# ==================== 多局统计 ====================
-class GameStats:
-    def __init__(self):
-        self.total = 0
-        self.wolf_wins = 0
-        self.good_wins = 0
-        self.rounds_list = []
-        self.antidote_used = 0
-        self.poison_used = 0
-        self.poison_hit_wolf = 0
-        self.poison_hit_good = 0
-        self.guard_saved = 0
-
-    def record(self, result):
-        self.total += 1
-        if result["winner"] == "werewolves":
-            self.wolf_wins += 1
-        else:
-            self.good_wins += 1
-        self.rounds_list.append(result["rounds"])
-        if result["antidote_used"]:
-            self.antidote_used += 1
-        if result["poison_used"]:
-            self.poison_used += 1
-        self.poison_hit_wolf += result.get("poison_hit_wolf", 0)
-        self.poison_hit_good += result.get("poison_hit_good", 0)
-        self.guard_saved += result.get("guard_saved", 0)
-
-    def summary_text(self):
-        lines = []
-        lines.append("=" * 60)
-        lines.append("📊 多局对战统计（8 人局 + 守卫）")
-        lines.append("=" * 60)
-        lines.append(f"总对局数：{self.total}")
-        if self.total > 0:
-            lines.append(f"狼人胜：{self.wolf_wins} 局（{self.wolf_wins/self.total*100:.1f}%）")
-            lines.append(f"好人胜：{self.good_wins} 局（{self.good_wins/self.total*100:.1f}%）")
-        if self.rounds_list:
-            avg = sum(self.rounds_list) / len(self.rounds_list)
-            lines.append(f"平均回合数：{avg:.2f}")
-            lines.append(f"最短/最长回合：{min(self.rounds_list)} / {max(self.rounds_list)}")
-        lines.append(f"女巫用解药的局数：{self.antidote_used}")
-        lines.append(f"女巫用毒药的局数：{self.poison_used}")
-        lines.append(f"女巫毒对狼：{self.poison_hit_wolf} 次")
-        lines.append(f"女巫毒错好人：{self.poison_hit_good} 次")
-        lines.append(f"守卫成功救人：{self.guard_saved} 次")
-        lines.append("=" * 60)
-        return "\n".join(lines)
-
-    def print_summary(self):
-        print("\n\n" + self.summary_text())
-
-    def save_summary(self, path):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(self.summary_text())
-
-
 # ==================== 主入口 ====================
 async def main():
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(_loop_exception_handler)
 
-    NUM_GAMES = 5  # ★ 改这里可以跑更多局
+    NUM_GAMES = 1  # 人机对战默认跑 1 局
 
-    # ★ 8 人局
-    player_names = ["刘备", "曹操", "孙权", "诸葛亮", "司马懿", "周瑜", "张飞", "关羽"]
-    stats = GameStats()
+    player_names = ["你", "曹操", "刘备", "孙权", "诸葛亮", "司马懿", "周瑜", "关羽"]
 
     for i in range(1, NUM_GAMES + 1):
         print(f"\n\n{'#' * 60}")
@@ -784,16 +761,11 @@ async def main():
 
         game = WerewolfGame(player_names, game_index=i)
         result = await game.run_single_game()
-        stats.record(result)
 
         log_path = game.logger.save("game_logs")
         print(f"\n>>> 第 {i} 局日志已保存：{log_path}")
         winner_txt = "🐺 狼人胜" if result["winner"] == "werewolves" else "🎉 好人胜"
         print(f">>> 第 {i} 局结果：{winner_txt}（{result['rounds']} 回合）")
-
-    stats.print_summary()
-    stats.save_summary("game_logs/summary.txt")
-    print(f"\n📁 汇总已保存：game_logs/summary.txt")
 
 
 if __name__ == "__main__":
